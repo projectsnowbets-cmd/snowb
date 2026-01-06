@@ -83,25 +83,28 @@ with st.sidebar:
         pre_ah_home = st.number_input("Home Odds", value=1.85, step=0.01, key="pre_home", format="%.2f")
         pre_ah_away = st.number_input("Away Odds", value=1.95, step=0.01, key="pre_away", format="%.2f")
 
-    st.markdown("**Live AH (Optional)**")
-    live_enabled = st.checkbox("Match has started (use live odds)")
-    live_ah_line = st.number_input("Line", value=0.0, step=0.25, key="live_line", format="%.2f")
-    live_ah_home = st.number_input("Home Odds", value=1.80, step=0.01, key="live_home", format="%.2f")
-    live_ah_away = st.number_input("Away Odds", value=2.00, step=0.01, key="live_away", format="%.2f")
+    # Live AH moved into a collapsed expander so it's hidden by default
+    with st.expander("Live AH (Optional)", expanded=False):
+        live_enabled = st.checkbox("Match has started (use live odds)")
+        live_ah_line = st.number_input("Line", value=0.0, step=0.25, key="live_line", format="%.2f")
+        live_ah_home = st.number_input("Home Odds", value=1.80, step=0.01, key="live_home", format="%.2f")
+        live_ah_away = st.number_input("Away Odds", value=2.00, step=0.01, key="live_away", format="%.2f")
 
     st.markdown("---")
-    st.header("⚙️ Thresholds & League")
-    # League presets to adjust volatility / thresholds
-    league = st.selectbox("League / Market profile", ["Top leagues (low vol)", "Mid leagues (med vol)", "Low leagues (high vol)"])
-    # User-configurable thresholds
-    st.markdown("Odds & line thresholds (editable):")
-    reverse_line_threshold = st.number_input("Reverse correlation line shift (goals)", value=0.25, step=0.25, format="%.2f")
-    reverse_odds_pct = st.number_input("Reverse correlation odds rise (%)", value=5.0, step=0.5, format="%.1f")
-    violent_drop_pct = st.number_input("Violent odds drop threshold (%)", value=15.0, step=1.0, format="%.1f")
-    steam_odds_pct = st.number_input("Steam odds movement (%)", value=5.0, step=0.5, format="%.1f")
-    steam_time_window = st.number_input("Steam time window (min)", value=15, min_value=1, step=1)
-    margin_threshold = st.number_input("Margin change threshold (%)", value=3.0, step=0.5, format="%.1f")
-    override_extreme_drop = st.number_input("Override lock if live drop > (%)", value=25.0, step=1.0, format="%.1f")
+
+    # Put thresholds & league inside a collapsed expander by default
+    with st.expander("⚙️ Thresholds & League (advanced)", expanded=False):
+        # League presets to adjust volatility / thresholds
+        league = st.selectbox("League / Market profile", ["Top leagues (low vol)", "Mid leagues (med vol)", "Low leagues (high vol)"], index=1)
+        # User-configurable thresholds (defaults set per user's request)
+        st.markdown("Odds & line thresholds (editable):")
+        reverse_line_threshold = st.number_input("Reverse correlation line shift (goals)", value=0.25, step=0.25, format="%.2f")
+        reverse_odds_pct = st.number_input("Reverse correlation odds rise (%)", value=6.0, step=0.5, format="%.1f")
+        violent_drop_pct = st.number_input("Violent odds drop threshold (%)", value=18.0, step=1.0, format="%.1f")
+        steam_odds_pct = st.number_input("Steam odds movement (%)", value=6.0, step=0.5, format="%.1f")
+        steam_time_window = st.number_input("Steam time window (min)", value=12, min_value=1, step=1)
+        margin_threshold = st.number_input("Margin change threshold (%)", value=2.5, step=0.5, format="%.1f")
+        override_extreme_drop = st.number_input("Override lock if live drop > (%)", value=22.0, step=1.0, format="%.1f")
 
     st.markdown("---")
     if st.button("🔍 Analyze Match", type="primary", use_container_width=True):
@@ -642,6 +645,7 @@ if st.session_state.matches:
     last_match = st.session_state.matches[-1]
 
     # Prepare config dict from sidebar inputs (read current values from session-like variables)
+    # If the expander wasn't opened, the variables still exist with defaults defined above.
     cfg = {
         'reverse_line_threshold': float(reverse_line_threshold),
         'reverse_odds_pct': float(reverse_odds_pct),
@@ -921,7 +925,7 @@ else:
     - Margin alerts only flagged when aligned with other suspicious signals and with reduced weight.
     - Outcome locking on reverse detection; override only allowed by extreme live movements.
     - Refactored detection into helper functions for maintainability.
-    - Thresholds exposed in sidebar so power users can tune per league/market.
+    - Thresholds exposed in sidebar in a collapsed expander so power users can tune per league/market.
     - History stores additional metrics for post-analysis/backtesting.
     """)
 
