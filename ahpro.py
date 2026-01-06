@@ -46,6 +46,23 @@ st.markdown("""
         background-color: #e7f3ff;
         border-left: 5px solid #6c757d;
     }
+    .ah-explain {
+        border: 1px solid #ddd;
+        padding: 0.8rem;
+        border-radius: 6px;
+        background: #fafafa;
+        margin-top: 0.6rem;
+    }
+    .ah-explain table { width: 100%; border-collapse: collapse; }
+    .ah-explain td, .ah-explain th { padding: 6px 8px; vertical-align: top; border-bottom: 1px solid #eee; }
+    .ah-explain th { text-align: left; font-weight: 700; }
+    .ou-explain {
+        border: 1px solid #ddd;
+        padding: 0.8rem;
+        border-radius: 6px;
+        background: #fff;
+        margin-top: 0.6rem;
+    }
     @keyframes pulse {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.75; }
@@ -53,7 +70,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-header">⚽ Asian Handicap Predictor & Anomaly Detector</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">⚽ Asian Handicap & Over/Under Predictor + Anomaly Detector</div>', unsafe_allow_html=True)
 
 # -----------------------
 # Session initialization
@@ -67,8 +84,10 @@ if 'matches' not in st.session_state:
 with st.sidebar:
     st.header("🔍 Match Data Entry")
 
-    team_home = st.text_input("Home Team", placeholder="e.g., Manchester City")
-    team_away = st.text_input("Away Team", placeholder="e.g., Liverpool")
+    # Fixed team names per user's request
+    st.markdown("**Home Team:** `HOME`  \n**Away Team:** `AWAY`")
+    team_home = "HOME"
+    team_away = "AWAY"
 
     st.subheader("Asian Handicap Data")
     col1, col2 = st.columns(2)
@@ -112,9 +131,7 @@ with st.sidebar:
         def is_valid_ah_line(line):
             return abs(line * 4 - round(line * 4)) < 1e-8
 
-        if not (team_home and team_away):
-            st.error("Please enter both team names!")
-        elif not (is_valid_ah_line(open_ah_line) and is_valid_ah_line(pre_ah_line) and is_valid_ah_line(live_ah_line)):
+        if not (is_valid_ah_line(open_ah_line) and is_valid_ah_line(pre_ah_line) and is_valid_ah_line(live_ah_line)):
             st.error("Invalid Asian Handicap line(s). Lines must be multiples of 0.25 (quarter lines).")
         else:
             match_data = {
@@ -622,6 +639,7 @@ def predict_outcome(match, cfg):
     else:
         predicted = "AWAY"
         confidence = away_confidence
+        # represent AH pick as the away team's effective handicap (e.g., Away -0.25)
         ah_pick = f"Away {(-match['pre_line']):+.2f}"
 
     return {
@@ -636,6 +654,236 @@ def predict_outcome(match, cfg):
         'home_odds_change_pct': home_str,
         'away_odds_change_pct': away_str
     }
+
+# -----------------------
+# Over/Under prediction helpers
+# -----------------------
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+def predict_over_under(match, cfg):
+    """
+    Heuristic Over/Under predictor using AH opening & pre-match odds.
+    Approach:
+      - Build a simple expected total-goals baseline (2.5).
+      - Adjust by market moves: average odds movement magnitude and line strength.
+      - Normalize by league volatility.
+      - Convert expected goals into probabilities for typical thresholds (0.5,1.5,2.5,3.5,4.5).
+      - Return the best threshold prediction (OVER/UNDER X) with confidence score (0-100).
+    Note: This is a heuristic and intended as an additional signal, not definitive.
+    """
+    lv = league_volatility_pct(match.get('league_profile', 'Top leagues (low vol)'))
+
+    # Movements used (open->pre unless live provided)
+    home_live = match.get('live_home') if match.get('live_enabled') else None
+    away_live = match.get('live_away') if match.get('live_enabled') else None
+
+    # Use the same logic as other predictors to compute directional changes
+    home_dir, home_str = calculate_directional_odds_movement(match['open_home'], match['pre_home'], home_live)
+    away_dir, away_str = calculate_directional_odds_movement(match['open_away'], match['pre_away'], away_live)
+
+    # Line change magnitude (open -> pre)
+    fav_side, _ = determine_favorite(match['open_line'], match['open_home'], match['open_away'])
+    line_dir, line_str = interpret_line_movement(match['open_line'], match['pre_line'], fav_side)
+
+    # Baseline expected goals
+    expected_goals = 2.5
+
+    # Adjustment 1: stronger market moves -> more goals (heuristic)
+    avg_move = (home_str + away_str) / 2.0
+    # If both sides drop (rare), that's big market attention -> assume higher scoring expectation
+    # Normalize avg_move by league volatility
+    move_adj = (avg_move - (lv * 0.5)) / (lv if lv > 0 else 10)
+    expected_goals += move_adj * 1.2
+
+    # Adjustment 2: larger line shifts (toward one side) often indicate a desire for decisive win ->
+    # can slightly increase expected goals (bookmakers expect a clear result)
+    expected_goals += min(1.0, line_str * 0.6)
+
+    # Adjustment 3: if both teams' pre odds significantly higher than opening (less likely), reduce expectation
+    # Use difference in implied margin as signal for defensive markets
+    margin_open = calculate_margin(match['open_home'], match['open_away'])
+    margin_pre = calculate_margin(match['pre_home'], match['pre_away'])
+    margin_diff = margin_pre - margin_open
+    # If margin increases meaning bookmakers widen edge -> possible lower scoring (cautious)
+    expected_goals -= (margin_diff / 10.0)
+
+    # Bound expected goals to reasonable range
+    expected_goals = max(0.5, min(6.0, expected_goals))
+
+    # Thresholds to consider
+    thresholds = [0.5, 1.5, 2.5, 3.5, 4.5]
+
+    # For each threshold compute a probability of OVER using a sigmoid centered on expected_goals - threshold
+    # k determines steepness: use smaller k for noisy market
+    k = 1.2
+    probs = []
+    for t in thresholds:
+        p_over = _sigmoid((expected_goals - t) * k)
+        probs.append((t, p_over))
+
+    # Choose the threshold with highest distance from 0.5 (i.e., most decisive)
+    best = max(probs, key=lambda x: abs(x[1] - 0.5))
+    th, p_over = best
+    # Determine side and confidence
+    if p_over > 0.5:
+        pick = f"OVER {th:.1f}"
+        confidence = (p_over - 0.5) * 2.0  # scale 0..1
+    else:
+        pick = f"UNDER {th:.1f}"
+        confidence = (0.5 - p_over) * 2.0
+
+    # Convert confidence to percentage and apply small adjustments based on market clarity
+    conf_pct = float(min(99.0, max(25.0, confidence * 100.0 + (abs(line_str) * 8.0))))
+
+    # Provide short explanation strings
+    expl = f"Expected goals ≈ {expected_goals:.2f}. Based on AH line shift ({line_str:+.2f}) and avg odds movement ({avg_move:.2f}%)."
+    return {
+        'ou_pick': pick,
+        'ou_confidence': conf_pct,
+        'expected_goals': expected_goals,
+        'explanation': expl,
+        'threshold_probability': float(p_over)
+    }
+
+# -----------------------
+# Asian Handicap explanation helper
+# -----------------------
+def generate_ah_explanation_html(ah_pick):
+    """
+    Given a pick string like "Away -0.25" or "Home +0.50", generate an HTML
+    explanation table describing outcomes for:
+      - Pick team wins
+      - Match draw
+      - Pick team loses
+    This covers common quarter-line cases: .00, .25, .50, .75
+    """
+    try:
+        parts = ah_pick.split()
+        side = parts[0]
+        line_val = float(parts[1])
+    except Exception:
+        return ""
+
+    sign = -1 if line_val < 0 else 1
+    abs_line = abs(line_val)
+    # Determine fractional part in quarters (0, 1, 2, 3)
+    quarters = int(round(abs_line * 4)) % 4
+    int_part = int(abs_line)  # whole number part
+
+    # Helpers to build rows
+    def row(outcome, label, explanation):
+        return f"<tr><th style='width:34%'>{outcome}</th><td style='width:14%'>{label}</td><td>{explanation}</td></tr>"
+
+    # Compute descriptions
+    # Generic defaults (safe fallbacks)
+    pick_wins_label = "✅ Full Win"
+    pick_wins_expl = "Both halves / full stake win (depending on split)."
+
+    draw_label = "➖ Push / Half"
+    draw_expl = "Depends on split: may be push, half-win, or half-loss."
+
+    pick_loses_label = "❌ Full Loss"
+    pick_loses_expl = "Both halves / full stake lose."
+
+    # Cases by quarters
+    if quarters == 0:
+        # whole number e.g., 0.00, 1.00, 2.00
+        # Example: -1.00 means picked team gives 1 goal
+        if int_part == 0:
+            # 0.00 (no handicap)
+            pick_wins_label = "✅ Full Win"
+            pick_wins_expl = "If the picked team wins the match, bet wins; draw is a push; loss is a full loss."
+            draw_label = "➖ Push"
+            draw_expl = "Exact refund of stake if match ends level."
+            pick_loses_label = "❌ Full Loss"
+            pick_loses_expl = "Bet loses if picked team loses."
+        else:
+            # whole >0
+            pick_wins_label = "✅ Full Win (if win by more than {})".format(int_part)
+            pick_wins_expl = f"Picked team must win by more than {int_part} goal(s) for a full win. If they win by exactly {int_part} it's a push (refund)."
+            draw_label = "❌ Full Loss"
+            draw_expl = "Draw is a loss for handicaps of whole numbers >0 for the giving side."
+            pick_loses_label = "❌ Full Loss"
+            pick_loses_expl = "Picked team loses => full loss."
+    elif quarters == 1:
+        # .25
+        # Negative (team gives -0.25): split between 0 and -0.5 -> draw => half loss
+        # Positive (+0.25): draw => half win
+        pick_wins_label = "✅ Full Win"
+        pick_wins_expl = "If the picked team wins the match (any margin), the bet is a full win."
+        if sign < 0:
+            draw_label = "➖ Half Loss"
+            draw_expl = f"The bet is split: the '0' half is refunded, the '-0.5' half loses."
+        else:
+            draw_label = "➕ Half Win"
+            draw_expl = f"The bet is split: the '0' half is refunded, the '+0.5' half wins."
+        pick_loses_label = "❌ Full Loss"
+        pick_loses_expl = "If the picked team loses the match, both halves lose."
+    elif quarters == 2:
+        # .50
+        pick_wins_label = "✅ Full Win"
+        pick_wins_expl = "Picked team wins = full win."
+        if sign < 0:
+            draw_label = "❌ Full Loss"
+            draw_expl = "Draw results in full loss for a negative (giving) -0.5 handicap."
+        else:
+            draw_label = "✅ Full Win"
+            draw_expl = "Draw results in full win for a positive (receiving) +0.5 handicap."
+        pick_loses_label = "❌ Full Loss"
+        pick_loses_expl = "Picked team loses => full loss."
+    elif quarters == 3:
+        # .75 (split between .5 and 1.0)
+        # Negative (e.g., -0.75): win by 2+ full win; win by 1 => half win; draw => full loss
+        # Positive (+0.75): draw => half win; win by 1 => half win; win by 2+ full win
+        pick_wins_label = "✅ Full Win / Half Win"
+        if sign < 0:
+            pick_wins_expl = "If picked team wins by 2+ goals => full win. If they win by exactly 1 => half win (one half wins, one half pushes)."
+            draw_label = "❌ Full Loss"
+            draw_expl = "Draw results in full loss for a -0.75 giving handicap."
+        else:
+            pick_wins_expl = "If picked team wins by 2+ goals => full win. If they win by exactly 1 => half win (one half wins, one half pushes)."
+            draw_label = "➕ Half Win"
+            draw_expl = "Draw results in a half win for +0.75 (the +0.5 half wins, the +1.0 half pushes)."
+        pick_loses_label = "❌ Full Loss"
+        pick_loses_expl = "Picked team loses => full loss."
+
+    # Build HTML
+    side_label = side
+    html = f"""
+    <div class='ah-explain'>
+      <strong>What '{ah_pick}' means</strong>
+      <p style="margin:6px 0 10px 0;color:#444;">Pick: <strong>{side_label} {line_val:+.2f}</strong></p>
+      <table>
+        {row(f"{side_label} team wins", pick_wins_label, pick_wins_expl)}
+        {row("Match ends in a draw", draw_label, draw_expl)}
+        {row(f"{side_label} team loses", pick_loses_label, pick_loses_expl)}
+      </table>
+    </div>
+    """
+    return html
+
+def generate_ou_explanation_html(ou_pick, expected_goals, explanation):
+    """
+    Simple OU explanation block describing what OVER/UNDER X means and a short note.
+    """
+    try:
+        side, thr = ou_pick.split()
+    except Exception:
+        side = ou_pick
+        thr = ""
+    html = f"""
+      <div class='ou-explain'>
+        <strong>What '{ou_pick}' means</strong>
+        <p style="margin:6px 0 8px 0;color:#444;">This prediction estimates total goals in the match.</p>
+        <ul>
+          <li><strong>Expected goals:</strong> {expected_goals:.2f}</li>
+          <li><strong>Interpretation:</strong> If '{ou_pick}' = OVER {thr}, we expect the match to have more than {thr} goals (combined). UNDER means fewer than {thr} goals.</li>
+        </ul>
+        <p style="margin:6px 0 0 0;color:#666;"><em>Reasoning:</em> {explanation}</p>
+      </div>
+    """
+    return html
 
 # -----------------------
 # Main UI / Analysis flow
@@ -661,10 +909,12 @@ if st.session_state.matches:
     with tab1:
         st.subheader(f"🏟️ {last_match['home_team']} vs {last_match['away_team']}")
         prediction = predict_outcome(last_match, cfg)
+        ou_prediction = predict_over_under(last_match, cfg)
 
         confidence_level = "high" if prediction['confidence'] > 75 else "medium" if prediction['confidence'] > 60 else "low"
         box_class = f"{confidence_level}-confidence"
 
+        # Main AH prediction box
         st.markdown(f"""
         <div class="prediction-box {box_class}">
             <h3>🎯 Market Prediction: {prediction['predicted_winner']} Team</h3>
@@ -675,13 +925,32 @@ if st.session_state.matches:
         </div>
         """, unsafe_allow_html=True)
 
+        # AH explanation for new users (always shown for the predicted AH pick)
+        ah_html = generate_ah_explanation_html(prediction['ah_pick'])
+        if ah_html:
+            st.markdown(ah_html, unsafe_allow_html=True)
+
+        # Over/Under prediction box
+        ou_conf_level = "high" if ou_prediction['ou_confidence'] > 75 else "medium" if ou_prediction['ou_confidence'] > 60 else "low"
+        ou_box_class = f"{ou_conf_level}-confidence"
+        st.markdown(f"""
+        <div class="prediction-box {ou_box_class}">
+            <h3>📊 Over/Under Prediction: {ou_prediction['ou_pick']}</h3>
+            <h2>Confidence: {ou_prediction['ou_confidence']:.1f}%</h2>
+            <p><strong>Estimated total goals:</strong> {ou_prediction['expected_goals']:.2f}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # OU explanation block
+        st.markdown(generate_ou_explanation_html(ou_prediction['ou_pick'], ou_prediction['expected_goals'], ou_prediction['explanation']), unsafe_allow_html=True)
+
         # Explanations (tooltips) in an expander
         with st.expander("Why this prediction? (explain metrics)"):
-            st.write("- Line movement weighted 40% of score.")
-            st.write("- Odds movement normalized by league volatility and weighted 35%.")
-            st.write("- Current market position (which side has lower odds) weighted 25%.")
-            st.write("- Correlation between line and odds adds a small reinforcement bonus; misalignment penalizes slightly.")
-            st.write("- Neutral markets (small line and tiny odds difference) reduce final confidence to avoid overcommitting.")
+            st.write("- Line movement weighted 40% of score for AH prediction.")
+            st.write("- Odds movement normalized by league volatility and weighted 35% for AH prediction.")
+            st.write("- Current market position (which side has lower odds) weighted 25% for AH prediction.")
+            st.write("- Over/Under uses a heuristic: baseline 2.5 goals adjusted by average odds movement and line shifts.")
+            st.write("- Both predictions include conservative confidence scaling for neutral markets.")
 
     with tab2:
         st.subheader("🚨 Match Integrity Analysis")
@@ -727,6 +996,8 @@ if st.session_state.matches:
                     <p style='text-align: center;'><strong>Asian Handicap (OPPOSITE SIDE VALUE):</strong> {ah_pick}</p>
                 </div>
                 """, unsafe_allow_html=True)
+                # show AH explanation for the recommended value side pick
+                st.markdown(generate_ah_explanation_html(ah_pick), unsafe_allow_html=True)
             else:
                 win_side = suspected_result.split('_')[0]
                 winning_team = last_match['home_team'] if win_side == 'HOME' else last_match['away_team']
@@ -741,6 +1012,8 @@ if st.session_state.matches:
                     <p style='text-align: center;'><strong>Asian Handicap:</strong> {ah_pick}</p>
                 </div>
                 """, unsafe_allow_html=True)
+                # show AH explanation for the suspected pick
+                st.markdown(generate_ah_explanation_html(ah_pick), unsafe_allow_html=True)
 
             # Betting recommendation wording
             if fix_confidence >= 70:
@@ -826,6 +1099,7 @@ if st.session_state.matches:
             st.write("- Fix Confidence: how confident the system is that the market reflects manipulation/fixing.")
             st.write("- Reverse correlation: when bookmakers shift line toward one side but that side's odds increase (money avoiding).")
             st.write("- Steam moves: rapid, synchronized movement suggesting sharp consensus (not necessarily a fix).")
+            st.write("- Over/Under predictions are supplementary and derived heuristically from AH and odds movement; treat cautiously.")
 
     with tab3:
         st.subheader("📈 Odds & Line Movement Visualization")
@@ -878,6 +1152,7 @@ if st.session_state.matches:
             for match in st.session_state.matches:
                 analysis = detect_suspicious_patterns(match, cfg)
                 pred = predict_outcome(match, cfg)
+                ou_pred = predict_over_under(match, cfg)
 
                 suspected_txt = "None"
                 if analysis['suspected_result']:
@@ -894,6 +1169,10 @@ if st.session_state.matches:
                     'Fix Confidence': f"{analysis['fix_confidence']}%",
                     'Risk Score': f"{analysis['risk_score']}/100",
                     'Market Prediction': pred['predicted_winner'],
+                    'AH Pick': pred['ah_pick'],
+                    'AH Confidence': f"{pred['confidence']:.1f}%",
+                    'OU Prediction': ou_pred['ou_pick'],
+                    'OU Confidence': f"{ou_pred['ou_confidence']:.1f}%",
                     'Line Strength': analysis.get('line_strength', 0),
                     'Home Odds Change %': f"{analysis.get('home_odds_change_pct', 0):.1f}",
                     'Away Odds Change %': f"{analysis.get('away_odds_change_pct', 0):.1f}",
@@ -927,6 +1206,8 @@ else:
     - Refactored detection into helper functions for maintainability.
     - Thresholds exposed in sidebar in a collapsed expander so power users can tune per league/market.
     - History stores additional metrics for post-analysis/backtesting.
+    - Team naming removed from user input; fixed names "HOME" and "AWAY" used to reduce accidental mislabeling.
+    - Added Over/Under heuristic prediction (OVER/UNDER 0.5,1.5,2.5,3.5,4.5) with confidence based on AH & odds movement.
     """)
 
 st.markdown("---")
