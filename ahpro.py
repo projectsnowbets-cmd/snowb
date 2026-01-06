@@ -550,6 +550,7 @@ def predict_outcome(match, cfg):
     - normalization of odds movement by league volatility baseline
     - correlation bonus/penalty
     - neutral-market cautious handling
+    Returns both home_confidence and away_confidence in addition to the previous fields.
     """
     # league volatility baseline
     lv = league_volatility_pct(match.get('league_profile', 'Top leagues (low vol)'))
@@ -652,7 +653,10 @@ def predict_outcome(match, cfg):
         'away_odds_direction': away_dir,
         'line_strength': line_str,
         'home_odds_change_pct': home_str,
-        'away_odds_change_pct': away_str
+        'away_odds_change_pct': away_str,
+        # expose both per-side confidences for use in 1X2 prediction
+        'home_confidence': float(home_confidence),
+        'away_confidence': float(away_confidence)
     }
 
 # -----------------------
@@ -744,6 +748,147 @@ def predict_over_under(match, cfg):
         'expected_goals': expected_goals,
         'explanation': expl,
         'threshold_probability': float(p_over)
+    }
+
+# -----------------------
+# 1X2 Prediction helper (NEW)
+# -----------------------
+def predict_1x2(match, cfg, analysis=None):
+    """
+    Produce a 1X2 probability distribution (Home / Draw / Away) in percentages.
+    This uses:
+      - market implied information from pre-match odds
+      - the AH-based prediction confidences (from predict_outcome)
+      - Over/Under expected goals heuristic (to estimate draw probability)
+      - suspiciousness metrics (risk_score + fix_confidence) to compute an anomaly/fix probability
+        and to nudge probabilities toward suspected manipulated outcomes when applicable.
+    Returns: dict with 'home_pct', 'draw_pct', 'away_pct', 'fix_probability_pct', and 'explanation'
+    """
+    # Reuse other predictors
+    pred = predict_outcome(match, cfg)
+    ou = predict_over_under(match, cfg)
+
+    # Estimate draw probability heuristically
+    # Base draw centered ~0.26 for balanced markets; decrease with larger AH magnitude and higher expected goals
+    pre_line = match.get('pre_line', 0.0)
+    expected_goals = ou.get('expected_goals', 2.5)
+
+    # Heuristic formula (tunable): smaller absolute line and lower expected goals -> higher draw prob
+    draw_prob = 0.26 - (abs(pre_line) * 0.04) - ((expected_goals - 2.5) * 0.03)
+    draw_prob = max(0.06, min(0.50, draw_prob))  # clamp between 6% and 50%
+
+    remaining = max(0.0, 1.0 - draw_prob)
+
+    # Use AH-prediction confidences as the split between Home/Away (these sum to ~100)
+    home_share = pred.get('home_confidence', 50.0) / 100.0
+    away_share = pred.get('away_confidence', 50.0) / 100.0
+
+    initial_home = home_share * remaining
+    initial_away = away_share * remaining
+    initial_draw = draw_prob
+
+    # Market two-way implied (normalize pre odds)
+    ph = calculate_implied_probability(match.get('pre_home', 1.0))
+    pa = calculate_implied_probability(match.get('pre_away', 1.0))
+    denom = ph + pa
+    if denom > 0:
+        market_home_two_way = ph / denom
+    else:
+        market_home_two_way = 0.5
+
+    # Blend market and model (tunable weights)
+    w_model = 0.6
+    w_market = 0.4
+
+    blended_home = w_model * initial_home + w_market * (market_home_two_way * remaining)
+    blended_away = w_model * initial_away + w_market * ((1.0 - market_home_two_way) * remaining)
+    blended_draw = initial_draw  # leave draw as estimated
+
+    # normalize to sum 1.0
+    total = blended_home + blended_away + blended_draw
+    if total <= 0:
+        blended_home = blended_away = 0.33
+        blended_draw = 0.34
+        total = 1.0
+
+    blended_home /= total
+    blended_away /= total
+    blended_draw /= total
+
+    # Suspicion / fix probability
+    if analysis is None:
+        analysis = detect_suspicious_patterns(match, cfg)
+    risk_score = analysis.get('risk_score', 0)
+    fix_conf = analysis.get('fix_confidence', 0)
+
+    # Combine risk_score and fix_confidence to a single fix-probability heuristic (0..1)
+    fix_prob = (0.6 * (risk_score / 100.0)) + (0.4 * (fix_conf / 100.0))
+    fix_prob = max(0.0, min(1.0, fix_prob))
+
+    # If suspected_result exists, nudge probabilities toward the suspected side by an amount proportional to fix_prob
+    suspected = analysis.get('suspected_result')
+    if suspected:
+        # determine which side is favored by the manipulation signal
+        if suspected.endswith('_FAIL'):
+            # if a team is expected to FAIL, the opposite side is the value/winner
+            fail_side = suspected.split('_')[0]
+            favored_side = 'AWAY' if fail_side == 'HOME' else 'HOME'
+        else:
+            favored_side = suspected.split('_')[0]
+
+        # nudge factor (max ~0.25 when fix_prob=1)
+        nudge = fix_prob * 0.25
+        # apply nudge additively to favored side, reduce others proportionally
+        if favored_side == 'HOME':
+            before = blended_home
+            blended_home += nudge
+            reduce_total = nudge
+            other_sum = blended_away + blended_draw
+            if other_sum > 1e-9:
+                blended_away *= max(0.0, (1.0 - (reduce_total * (blended_away / other_sum)) / blended_away)) if blended_away > 0 else 0.0
+                blended_draw *= max(0.0, (1.0 - (reduce_total * (blended_draw / other_sum)) / blended_draw)) if blended_draw > 0 else 0.0
+            # if numerical issues occurred, fallback to proportional scaling
+        else:
+            before = blended_away
+            blended_away += nudge
+            reduce_total = nudge
+            other_sum = blended_home + blended_draw
+            if other_sum > 1e-9:
+                blended_home *= max(0.0, (1.0 - (reduce_total * (blended_home / other_sum)) / blended_home)) if blended_home > 0 else 0.0
+                blended_draw *= max(0.0, (1.0 - (reduce_total * (blended_draw / other_sum)) / blended_draw)) if blended_draw > 0 else 0.0
+
+        # simpler robust approach: if the above proportional adjustments create NaN or sum !=1, re-normalize
+        total = blended_home + blended_away + blended_draw
+        if total <= 0:
+            blended_home = blended_away = blended_draw = 1.0 / 3.0
+        else:
+            blended_home /= total
+            blended_away /= total
+            blended_draw /= total
+
+    # final percentages
+    home_pct = float(round(blended_home * 100.0, 1))
+    draw_pct = float(round(blended_draw * 100.0, 1))
+    away_pct = float(round(blended_away * 100.0, 1))
+    fix_probability_pct = float(round(fix_prob * 100.0, 1))
+
+    explanation = (
+        f"1X2 uses AH-derived model (60%) blended with market implied two-way (40%). "
+        f"Draw estimated from expected goals and pre-line. Fix probability derived from risk score & fix confidence ({fix_probability_pct}%)."
+    )
+
+    return {
+        'home_pct': home_pct,
+        'draw_pct': draw_pct,
+        'away_pct': away_pct,
+        'fix_probability_pct': fix_probability_pct,
+        'explanation': explanation,
+        'raw': {
+            'blended_home': blended_home,
+            'blended_draw': blended_draw,
+            'blended_away': blended_away,
+            'fix_prob': fix_prob
+        }
     }
 
 # -----------------------
@@ -911,6 +1056,10 @@ if st.session_state.matches:
         prediction = predict_outcome(last_match, cfg)
         ou_prediction = predict_over_under(last_match, cfg)
 
+        # compute 1X2 including anomaly/fix probability
+        analysis_for_1x2 = detect_suspicious_patterns(last_match, cfg)
+        one_x_two = predict_1x2(last_match, cfg, analysis=analysis_for_1x2)
+
         confidence_level = "high" if prediction['confidence'] > 75 else "medium" if prediction['confidence'] > 60 else "low"
         box_class = f"{confidence_level}-confidence"
 
@@ -941,6 +1090,19 @@ if st.session_state.matches:
         </div>
         """, unsafe_allow_html=True)
 
+        # 1X2 prediction box (NEW)
+        # Determine visual class: if max outcome pct > 60 => high, >45 => medium, else low
+        max_pct = max(one_x_two['home_pct'], one_x_two['draw_pct'], one_x_two['away_pct'])
+        one_class = "high-confidence" if max_pct > 60 else "medium-confidence" if max_pct > 45 else "low-confidence"
+        st.markdown(f"""
+        <div class="prediction-box {one_class}">
+            <h3>1X2 Prediction</h3>
+            <h2>Home: {one_x_two['home_pct']}%  —  Draw: {one_x_two['draw_pct']}%  —  Away: {one_x_two['away_pct']}%</h2>
+            <p><strong>Anomaly / Fix Probability:</strong> {one_x_two['fix_probability_pct']}%</p>
+            <p style="margin-top:6px;color:#444;"><em>{one_x_two['explanation']}</em></p>
+        </div>
+        """, unsafe_allow_html=True)
+
         # OU explanation block
         st.markdown(generate_ou_explanation_html(ou_prediction['ou_pick'], ou_prediction['expected_goals'], ou_prediction['explanation']), unsafe_allow_html=True)
 
@@ -949,6 +1111,8 @@ if st.session_state.matches:
             st.write("- Line movement weighted 40% of score for AH prediction.")
             st.write("- Odds movement normalized by league volatility and weighted 35% for AH prediction.")
             st.write("- Current market position (which side has lower odds) weighted 25% for AH prediction.")
+            st.write("- 1X2 blends the AH-derived model (60%) with market implied two-way (40%). Draw is estimated from expected goals and pre-line.")
+            st.write("- Fix probability comes from the anomaly detector (risk score + fix confidence). When a high fix probability and a suspected manipulation side exists, 1X2 is nudged toward the suspected outcome.")
             st.write("- Over/Under uses a heuristic: baseline 2.5 goals adjusted by average odds movement and line shifts.")
             st.write("- Both predictions include conservative confidence scaling for neutral markets.")
 
@@ -1153,6 +1317,7 @@ if st.session_state.matches:
                 analysis = detect_suspicious_patterns(match, cfg)
                 pred = predict_outcome(match, cfg)
                 ou_pred = predict_over_under(match, cfg)
+                one_x_two_row = predict_1x2(match, cfg, analysis=analysis)
 
                 suspected_txt = "None"
                 if analysis['suspected_result']:
@@ -1173,6 +1338,10 @@ if st.session_state.matches:
                     'AH Confidence': f"{pred['confidence']:.1f}%",
                     'OU Prediction': ou_pred['ou_pick'],
                     'OU Confidence': f"{ou_pred['ou_confidence']:.1f}%",
+                    '1X2 Home %': f"{one_x_two_row['home_pct']:.1f}",
+                    '1X2 Draw %': f"{one_x_two_row['draw_pct']:.1f}",
+                    '1X2 Away %': f"{one_x_two_row['away_pct']:.1f}",
+                    '1X2 Fix %': f"{one_x_two_row['fix_probability_pct']:.1f}",
                     'Line Strength': analysis.get('line_strength', 0),
                     'Home Odds Change %': f"{analysis.get('home_odds_change_pct', 0):.1f}",
                     'Away Odds Change %': f"{analysis.get('away_odds_change_pct', 0):.1f}",
@@ -1208,6 +1377,7 @@ else:
     - History stores additional metrics for post-analysis/backtesting.
     - Team naming removed from user input; fixed names "HOME" and "AWAY" used to reduce accidental mislabeling.
     - Added Over/Under heuristic prediction (OVER/UNDER 0.5,1.5,2.5,3.5,4.5) with confidence based on AH & odds movement.
+    - Added 1X2 prediction (Home/Draw/Away) with percentages and a separate anomaly/fix probability. 1X2 blends AH-based model with market implied two-way and uses the OU expected goals to estimate draw likelihood.
     """)
 
 st.markdown("---")
