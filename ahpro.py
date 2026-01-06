@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
+import math
 
 # Page configuration
 st.set_page_config(page_title="Asian Handicap Predictor", page_icon="⚽", layout="wide")
@@ -124,6 +125,17 @@ with st.sidebar:
         steam_time_window = st.number_input("Steam time window (min)", value=12, min_value=1, step=1)
         margin_threshold = st.number_input("Margin change threshold (%)", value=2.5, step=0.5, format="%.1f")
         override_extreme_drop = st.number_input("Override lock if live drop > (%)", value=22.0, step=1.0, format="%.1f")
+
+        st.markdown("---")
+        st.markdown("1X2 blending & nudge settings (tuneable without historical data):")
+        w_model = st.slider("Weight for Poisson-model (Home/Draw/Away) in 1X2 blend", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
+        w_market = st.slider("Weight for market two-way in 1X2 blend (allocates across home/away)", min_value=0.0, max_value=1.0, value=0.4, step=0.05)
+        max_nudge = st.slider("Max nudge toward suspected manipulated side (fraction of prob)", min_value=0.0, max_value=0.5, value=0.25, step=0.01)
+
+        st.markdown("---")
+        st.markdown("Override behavior when system is extremely confident:")
+        override_fix_threshold = st.slider("Override 1X2 when fix probability ≥ (%)", min_value=50, max_value=99, value=90, step=1)
+        override_strength_pct = st.slider("Override strength (%) - favored side probability when overriding", min_value=75, max_value=99, value=95, step=1)
 
     st.markdown("---")
     if st.button("🔍 Analyze Match", type="primary", use_container_width=True):
@@ -254,10 +266,7 @@ def calculate_directional_odds_movement(open_odds, pre_odds, live_odds=None):
 
     pct = ((final - base) / base) * 100.0
     if pct < -1e-6 and abs(pct) >= 0.1:
-        if pct < -3.0:
-            return 'DROP', abs(pct)
-        else:
-            return 'DROP', abs(pct)
+        return 'DROP', abs(pct)
     elif pct > 3.0:
         return 'RISE', abs(pct)
     else:
@@ -275,7 +284,6 @@ def league_volatility_pct(league_profile):
 # Suspicion detection helpers
 # -----------------------
 def detect_reverse_correlation(match, line_direction, line_strength, home_dir, home_str, away_dir, away_str, cfg):
-    """Return (detected_bool, result_string, flags, indicators, scores_to_add)"""
     flags = []
     inds = []
     score_add = 0
@@ -283,11 +291,9 @@ def detect_reverse_correlation(match, line_direction, line_strength, home_dir, h
     reverse = False
     result = None
 
-    # Require meaningful line shift and meaningful opposite odds move (>= configured)
     thr_line = cfg['reverse_line_threshold']
     thr_odds = cfg['reverse_odds_pct']
 
-    # Home reverse: line toward HOME but HOME odds rise
     if line_direction == 'HOME' and line_strength >= thr_line and home_dir == 'RISE' and home_str >= thr_odds:
         flags.append("🔥 CRITICAL: Line favors HOME but home odds INCREASED - HOME LIKELY ARRANGED TO UNDERPERFORM")
         inds.append("⚠️ HOME TEAM SUSPECTED TO LOSE (reverse correlation)")
@@ -296,7 +302,6 @@ def detect_reverse_correlation(match, line_direction, line_strength, home_dir, h
         reverse = True
         result = 'HOME_FAIL'
 
-    # Away reverse
     if line_direction == 'AWAY' and line_strength >= thr_line and away_dir == 'RISE' and away_str >= thr_odds:
         flags.append("🔥 CRITICAL: Line favors AWAY but away odds INCREASED - AWAY LIKELY ARRANGED TO UNDERPERFORM")
         inds.append("⚠️ AWAY TEAM SUSPECTED TO LOSE (reverse correlation)")
@@ -305,7 +310,6 @@ def detect_reverse_correlation(match, line_direction, line_strength, home_dir, h
         reverse = True
         result = 'AWAY_FAIL'
 
-    # Also check subtle reverse where both teams show contradictory small signals
     return reverse, result, flags, inds, score_add, conf_add
 
 def detect_violent_odds(match, home_dir, home_str, away_dir, away_str, cfg, league_vol):
@@ -314,9 +318,7 @@ def detect_violent_odds(match, home_dir, home_str, away_dir, away_str, cfg, leag
     score_add = 0
     conf_add = 0
     result = None
-    # dynamic threshold: use configured violent_drop_pct but allow scaling by league volatility
-    dyn_thr = cfg['violent_drop_pct']  # user supplied baseline
-    # If league more volatile, require slightly higher threshold
+    dyn_thr = cfg['violent_drop_pct']
     dyn_thr = dyn_thr * (league_vol / 10.0)
 
     if home_dir == 'DROP' and home_str >= dyn_thr:
@@ -338,7 +340,6 @@ def detect_steam_moves(match, line_direction, line_strength, home_dir, home_str,
     flags = []
     inds = []
     conf_add = 0
-    # Steam: rapid movement within configured window and exceeding configured pct/line
     if minutes_since_open <= cfg['steam_time_window'] and not reverse_detected:
         if line_strength >= 0.25 and ((line_direction == 'HOME' and home_dir == 'DROP') or (line_direction == 'AWAY' and away_dir == 'DROP')):
             inds.append("🔥 STEAM MOVE - synchronized sharp betting (line + odds)")
@@ -360,8 +361,6 @@ def calculate_margin_change_alert(match, cfg, line_direction, home_dir, away_dir
     margin_pre = calculate_margin(match['pre_home'], match['pre_away'])
     diff = abs(margin_pre - margin_open)
     if diff > cfg['margin_threshold']:
-        # only mark if aligns with other signals
-        # align with side that shows strength
         if line_direction == 'HOME' or home_dir == 'DROP':
             flags.append(f"💰 Unusual margin change (approx. {diff:.1f}%) aligning with HOME movement")
             inds.append("Bookmaker risk management active (HOME)")
@@ -378,11 +377,6 @@ def calculate_margin_change_alert(match, cfg, line_direction, home_dir, away_dir
 # Main suspicious detector (refactored flow)
 # -----------------------
 def detect_suspicious_patterns(match, cfg):
-    """
-    Main orchestrator - uses helper detectors.
-    Returns dictionary with detailed metrics for storage.
-    """
-
     flags = []
     manipulation_indicators = []
     risk_score = 0
@@ -390,26 +384,21 @@ def detect_suspicious_patterns(match, cfg):
     suspected_result = None
     reverse_detected = False
 
-    # Favorite using pre-market (open is used for initial favorite decision to interpret line movement direction)
     favorite_side, favorite_strength = determine_favorite(match['open_line'], match['open_home'], match['open_away'])
 
-    # Decide whether to use live line/odds (live_enabled must be true)
     use_live = bool(match.get('live_enabled'))
     home_live = match.get('live_home') if use_live else None
     away_live = match.get('live_away') if use_live else None
     use_live_line = use_live and (match.get('live_line') != match.get('pre_line'))
 
-    # Interpret movements
     line_direction, line_strength = interpret_line_movement(match['open_line'], match['pre_line'], favorite_side,
                                                            current_line=(match.get('live_line') if use_live_line else None))
 
     home_dir, home_str = calculate_directional_odds_movement(match['open_home'], match['pre_home'], home_live)
     away_dir, away_str = calculate_directional_odds_movement(match['open_away'], match['pre_away'], away_live)
 
-    # league volatility baseline
     lv = league_volatility_pct(match.get('league_profile', 'Top leagues (low vol)'))
 
-    # 1) Reverse correlation
     rev_detected, rev_result, rev_flags, rev_inds, rev_score, rev_conf = detect_reverse_correlation(
         match, line_direction, line_strength, home_dir, home_str, away_dir, away_str, cfg
     )
@@ -421,7 +410,6 @@ def detect_suspicious_patterns(match, cfg):
         suspected_result = rev_result
         reverse_detected = True
 
-    # 2) Violent odds drops (only if not reverse-locked)
     if not reverse_detected:
         vo_result, vo_flags, vo_inds, vo_score, vo_conf = detect_violent_odds(match, home_dir, home_str, away_dir, away_str, cfg, lv)
         if vo_result:
@@ -430,14 +418,12 @@ def detect_suspicious_patterns(match, cfg):
             risk_score += vo_score
             fix_confidence += vo_conf
             suspected_result = vo_result
-            # lock outcome (can be overridden later by extreme live)
             outcome_locked = True
         else:
             outcome_locked = False
     else:
         outcome_locked = True
 
-    # 3) Moderate movements (add smaller confidence if not locked)
     if not outcome_locked:
         if home_dir == 'DROP' and home_str > 8:
             flags.append(f"⚡ Significant HOME odds drop ({home_str:.1f}%)")
@@ -450,7 +436,6 @@ def detect_suspicious_patterns(match, cfg):
                 suspected_result = 'AWAY_WIN'
             fix_confidence += 20
 
-    # 4) Major line movements
     if line_strength >= 0.5:
         flags.append(f"🚨 Major line shift toward {line_direction} ({line_strength:.2f} goals)")
         manipulation_indicators.append(f"Bookmakers adjusted expectations toward {line_direction}")
@@ -459,14 +444,12 @@ def detect_suspicious_patterns(match, cfg):
         if not outcome_locked and not suspected_result:
             suspected_result = f"{line_direction}_WIN"
 
-    # 5) Margin change (reduced weight and only if aligned)
     m_flags, m_inds, m_score, m_conf = calculate_margin_change_alert(match, cfg, line_direction, home_dir, away_dir)
     flags.extend(m_flags)
     manipulation_indicators.extend(m_inds)
     risk_score += m_score
     fix_confidence += m_conf
 
-    # 6) Live movements (only if live enabled and not locked; severe live drops can override)
     if use_live and match.get('live_home') and match.get('live_away'):
         live_home_dir, live_home_str = calculate_directional_odds_movement(match['open_home'], match['pre_home'], match.get('live_home'))
         live_away_dir, live_away_str = calculate_directional_odds_movement(match['open_away'], match['pre_away'], match.get('live_away'))
@@ -485,7 +468,6 @@ def detect_suspicious_patterns(match, cfg):
                 if not suspected_result:
                     suspected_result = 'AWAY_WIN'
         else:
-            # If locked by reverse but extreme live movement occurs, allow override
             if live_home_dir == 'DROP' and live_home_str > cfg['override_extreme_drop']:
                 flags.append(f"🔁 OVERRIDE: live HOME drop {live_home_str:.1f}% exceeds override threshold")
                 suspected_result = 'HOME_WIN'
@@ -497,7 +479,6 @@ def detect_suspicious_patterns(match, cfg):
                 fix_confidence = min(100, fix_confidence + 40)
                 risk_score = min(100, risk_score + 20)
 
-    # 7) Steam moves detection (timing sensitive)
     minutes_since_open = (datetime.now() - match.get('timestamp', datetime.now())).total_seconds() / 60.0
     s_flags, s_inds, s_conf = detect_steam_moves(match, line_direction, line_strength, home_dir, home_str, away_dir, away_str,
                                                  cfg, minutes_since_open, reverse_detected)
@@ -505,7 +486,6 @@ def detect_suspicious_patterns(match, cfg):
     manipulation_indicators.extend(s_inds)
     fix_confidence += s_conf
 
-    # 8) Correlation bonus between line and odds:
     corr_bonus = 0
     corr_penalty = 0
     if line_direction == 'HOME' and home_dir == 'DROP':
@@ -519,7 +499,6 @@ def detect_suspicious_patterns(match, cfg):
     fix_confidence = min(100, fix_confidence + corr_bonus)
     fix_confidence = max(0, fix_confidence - corr_penalty)
 
-    # Final bounding
     risk_score = min(100, risk_score)
     fix_confidence = min(100, fix_confidence)
 
@@ -544,42 +523,27 @@ def detect_suspicious_patterns(match, cfg):
 # Prediction function (improved stability & weighting)
 # -----------------------
 def predict_outcome(match, cfg):
-    """
-    Prediction with:
-    - weighted contributions: line movement 40, odds movement 35, market position 25
-    - normalization of odds movement by league volatility baseline
-    - correlation bonus/penalty
-    - neutral-market cautious handling
-    Returns both home_confidence and away_confidence in addition to the previous fields.
-    """
-    # league volatility baseline
     lv = league_volatility_pct(match.get('league_profile', 'Top leagues (low vol)'))
 
-    # Favorite (pre-market)
     favorite_side, fav_strength = determine_favorite(match['pre_line'], match['pre_home'], match['pre_away'])
 
-    # use live if enabled
     home_live = match.get('live_home') if match.get('live_enabled') else None
     away_live = match.get('live_away') if match.get('live_enabled') else None
     use_live_line = bool(match.get('live_enabled')) and match.get('live_line') != match.get('pre_line')
 
-    # Movements
     line_dir, line_str = interpret_line_movement(match['open_line'], match['pre_line'], favorite_side,
                                                 current_line=(match.get('live_line') if use_live_line else None))
 
     home_dir, home_str = calculate_directional_odds_movement(match['open_home'], match['pre_home'], home_live)
     away_dir, away_str = calculate_directional_odds_movement(match['open_away'], match['pre_away'], away_live)
 
-    # Scores base
     home_score = 0.0
     away_score = 0.0
 
-    # Weight constants
     W_LINE = 40.0
     W_ODDS = 35.0
     W_MARKET = 25.0
 
-    # Line contribution
     if line_dir == 'HOME':
         home_score += W_LINE
     elif line_dir == 'AWAY':
@@ -588,38 +552,30 @@ def predict_outcome(match, cfg):
         home_score += W_LINE / 2.0
         away_score += W_LINE / 2.0
 
-    # Odds contribution normalized by league volatility baseline
-    # full W_ODDS when change >= league_volatility_pct
     home_score += W_ODDS * min(home_str / lv, 1.0) if home_dir == 'DROP' else 0.0
     away_score += W_ODDS * min(away_str / lv, 1.0) if away_dir == 'DROP' else 0.0
 
-    # Market position
     if match['pre_home'] < match['pre_away']:
         home_score += W_MARKET
     else:
         away_score += W_MARKET
 
-    # Correlation bonus: if line and odds align, small bonus
     if line_dir == 'HOME' and home_dir == 'DROP':
         home_score += 10.0
     if line_dir == 'AWAY' and away_dir == 'DROP':
         away_score += 10.0
-    # correlation penalty
     if (line_dir == 'HOME' and home_dir == 'RISE') or (line_dir == 'AWAY' and away_dir == 'RISE'):
         if line_dir == 'HOME':
             home_score -= 8.0
         else:
             away_score -= 8.0
 
-    # Avoid negative
     home_score = max(0.0, home_score)
     away_score = max(0.0, away_score)
 
-    # Cap each side
     home_score = min(home_score, 70.0)
     away_score = min(away_score, 70.0)
 
-    # Determine confidences
     total = home_score + away_score
     if total > 0:
         home_confidence = (home_score / total) * 100.0
@@ -627,9 +583,7 @@ def predict_outcome(match, cfg):
     else:
         home_confidence = away_confidence = 50.0
 
-    # Handle neutral markets conservatively
     if abs(match['pre_line']) <= 0.25 and abs(match['pre_home'] - match['pre_away']) < 0.05:
-        # lower final confidence to reflect uncertainty
         home_confidence = max(30.0, home_confidence * 0.6)
         away_confidence = max(30.0, away_confidence * 0.6)
 
@@ -640,7 +594,6 @@ def predict_outcome(match, cfg):
     else:
         predicted = "AWAY"
         confidence = away_confidence
-        # represent AH pick as the away team's effective handicap (e.g., Away -0.25)
         ah_pick = f"Away {(-match['pre_line']):+.2f}"
 
     return {
@@ -654,7 +607,6 @@ def predict_outcome(match, cfg):
         'line_strength': line_str,
         'home_odds_change_pct': home_str,
         'away_odds_change_pct': away_str,
-        # expose both per-side confidences for use in 1X2 prediction
         'home_confidence': float(home_confidence),
         'away_confidence': float(away_confidence)
     }
@@ -666,81 +618,49 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 def predict_over_under(match, cfg):
-    """
-    Heuristic Over/Under predictor using AH opening & pre-match odds.
-    Approach:
-      - Build a simple expected total-goals baseline (2.5).
-      - Adjust by market moves: average odds movement magnitude and line strength.
-      - Normalize by league volatility.
-      - Convert expected goals into probabilities for typical thresholds (0.5,1.5,2.5,3.5,4.5).
-      - Return the best threshold prediction (OVER/UNDER X) with confidence score (0-100).
-    Note: This is a heuristic and intended as an additional signal, not definitive.
-    """
     lv = league_volatility_pct(match.get('league_profile', 'Top leagues (low vol)'))
 
-    # Movements used (open->pre unless live provided)
     home_live = match.get('live_home') if match.get('live_enabled') else None
     away_live = match.get('live_away') if match.get('live_enabled') else None
 
-    # Use the same logic as other predictors to compute directional changes
     home_dir, home_str = calculate_directional_odds_movement(match['open_home'], match['pre_home'], home_live)
     away_dir, away_str = calculate_directional_odds_movement(match['open_away'], match['pre_away'], away_live)
 
-    # Line change magnitude (open -> pre)
     fav_side, _ = determine_favorite(match['open_line'], match['open_home'], match['open_away'])
     line_dir, line_str = interpret_line_movement(match['open_line'], match['pre_line'], fav_side)
 
-    # Baseline expected goals
     expected_goals = 2.5
 
-    # Adjustment 1: stronger market moves -> more goals (heuristic)
     avg_move = (home_str + away_str) / 2.0
-    # If both sides drop (rare), that's big market attention -> assume higher scoring expectation
-    # Normalize avg_move by league volatility
     move_adj = (avg_move - (lv * 0.5)) / (lv if lv > 0 else 10)
     expected_goals += move_adj * 1.2
 
-    # Adjustment 2: larger line shifts (toward one side) often indicate a desire for decisive win ->
-    # can slightly increase expected goals (bookmakers expect a clear result)
     expected_goals += min(1.0, line_str * 0.6)
 
-    # Adjustment 3: if both teams' pre odds significantly higher than opening (less likely), reduce expectation
-    # Use difference in implied margin as signal for defensive markets
     margin_open = calculate_margin(match['open_home'], match['open_away'])
     margin_pre = calculate_margin(match['pre_home'], match['pre_away'])
     margin_diff = margin_pre - margin_open
-    # If margin increases meaning bookmakers widen edge -> possible lower scoring (cautious)
     expected_goals -= (margin_diff / 10.0)
 
-    # Bound expected goals to reasonable range
     expected_goals = max(0.5, min(6.0, expected_goals))
 
-    # Thresholds to consider
     thresholds = [0.5, 1.5, 2.5, 3.5, 4.5]
-
-    # For each threshold compute a probability of OVER using a sigmoid centered on expected_goals - threshold
-    # k determines steepness: use smaller k for noisy market
     k = 1.2
     probs = []
     for t in thresholds:
         p_over = _sigmoid((expected_goals - t) * k)
         probs.append((t, p_over))
 
-    # Choose the threshold with highest distance from 0.5 (i.e., most decisive)
     best = max(probs, key=lambda x: abs(x[1] - 0.5))
     th, p_over = best
-    # Determine side and confidence
     if p_over > 0.5:
         pick = f"OVER {th:.1f}"
-        confidence = (p_over - 0.5) * 2.0  # scale 0..1
+        confidence = (p_over - 0.5) * 2.0
     else:
         pick = f"UNDER {th:.1f}"
         confidence = (0.5 - p_over) * 2.0
 
-    # Convert confidence to percentage and apply small adjustments based on market clarity
     conf_pct = float(min(99.0, max(25.0, confidence * 100.0 + (abs(line_str) * 8.0))))
-
-    # Provide short explanation strings
     expl = f"Expected goals ≈ {expected_goals:.2f}. Based on AH line shift ({line_str:+.2f}) and avg odds movement ({avg_move:.2f}%)."
     return {
         'ou_pick': pick,
@@ -751,130 +671,171 @@ def predict_over_under(match, cfg):
     }
 
 # -----------------------
-# 1X2 Prediction helper (NEW)
+# Poisson / 3-way helper (NEW)
+# -----------------------
+def poisson_pmf(k, lam):
+    if lam <= 0:
+        return 0.0 if k > 0 else 1.0
+    try:
+        return (lam ** k) * math.exp(-lam) / math.factorial(k)
+    except OverflowError:
+        return 0.0
+
+def three_way_from_expected_goals(lambda_h, lambda_a, max_goals=8):
+    p_home = 0.0
+    p_draw = 0.0
+    p_away = 0.0
+
+    for i in range(max_goals + 1):
+        ph = poisson_pmf(i, lambda_h)
+        for j in range(max_goals + 1):
+            pa = poisson_pmf(j, lambda_a)
+            prob = ph * pa
+            if i > j:
+                p_home += prob
+            elif i == j:
+                p_draw += prob
+            else:
+                p_away += prob
+
+    total = p_home + p_draw + p_away
+    if total <= 0:
+        return 1/3, 1/3, 1/3
+    return p_home / total, p_draw / total, p_away / total
+
+def split_expected_goals_to_team_lambdas(expected_goals, pre_line):
+    goal_diff = -pre_line
+    lambda_h = (expected_goals + goal_diff) / 2.0
+    lambda_a = (expected_goals - goal_diff) / 2.0
+    lambda_h = max(0.05, lambda_h)
+    lambda_a = max(0.05, lambda_a)
+    return lambda_h, lambda_a
+
+# -----------------------
+# 1X2 Prediction helper (WITH OVERRIDE)
 # -----------------------
 def predict_1x2(match, cfg, analysis=None):
     """
     Produce a 1X2 probability distribution (Home / Draw / Away) in percentages.
-    This uses:
-      - market implied information from pre-match odds
-      - the AH-based prediction confidences (from predict_outcome)
-      - Over/Under expected goals heuristic (to estimate draw probability)
-      - suspiciousness metrics (risk_score + fix_confidence) to compute an anomaly/fix probability
-        and to nudge probabilities toward suspected manipulated outcomes when applicable.
-    Returns: dict with 'home_pct', 'draw_pct', 'away_pct', 'fix_probability_pct', and 'explanation'
-    """
-    # Reuse other predictors
-    pred = predict_outcome(match, cfg)
-    ou = predict_over_under(match, cfg)
 
-    # Estimate draw probability heuristically
-    # Base draw centered ~0.26 for balanced markets; decrease with larger AH magnitude and higher expected goals
-    pre_line = match.get('pre_line', 0.0)
+    - Uses Poisson-derived 3-way (from OU expected goals).
+    - Blends model with market two-way using user-configured weights.
+    - If fix probability >= override threshold, applies a controlled override that heavily favors the suspected side.
+    - Otherwise applies a bounded nudge proportional to fix probability.
+    """
+    try:
+        global_w_model = float(w_model)
+        global_w_market = float(w_market)
+        global_max_nudge = float(max_nudge)
+    except Exception:
+        global_w_model = 0.6
+        global_w_market = 0.4
+        global_max_nudge = 0.25
+
+    try:
+        ov_threshold = float(override_fix_threshold) / 100.0
+        ov_strength = float(override_strength_pct) / 100.0
+    except Exception:
+        ov_threshold = 0.90
+        ov_strength = 0.95
+
+    w_model = max(0.0, min(1.0, global_w_model))
+    w_market = max(0.0, min(1.0, global_w_market))
+
+    ou = predict_over_under(match, cfg)
     expected_goals = ou.get('expected_goals', 2.5)
 
-    # Heuristic formula (tunable): smaller absolute line and lower expected goals -> higher draw prob
-    draw_prob = 0.26 - (abs(pre_line) * 0.04) - ((expected_goals - 2.5) * 0.03)
-    draw_prob = max(0.06, min(0.50, draw_prob))  # clamp between 6% and 50%
+    lambda_h, lambda_a = split_expected_goals_to_team_lambdas(expected_goals, match.get('pre_line', 0.0))
 
-    remaining = max(0.0, 1.0 - draw_prob)
+    model_home, model_draw, model_away = three_way_from_expected_goals(lambda_h, lambda_a, max_goals=8)
 
-    # Use AH-prediction confidences as the split between Home/Away (these sum to ~100)
-    home_share = pred.get('home_confidence', 50.0) / 100.0
-    away_share = pred.get('away_confidence', 50.0) / 100.0
-
-    initial_home = home_share * remaining
-    initial_away = away_share * remaining
-    initial_draw = draw_prob
-
-    # Market two-way implied (normalize pre odds)
     ph = calculate_implied_probability(match.get('pre_home', 1.0))
     pa = calculate_implied_probability(match.get('pre_away', 1.0))
     denom = ph + pa
     if denom > 0:
         market_home_two_way = ph / denom
+        market_away_two_way = pa / denom
     else:
-        market_home_two_way = 0.5
+        market_home_two_way = market_away_two_way = 0.5
 
-    # Blend market and model (tunable weights)
-    w_model = 0.6
-    w_market = 0.4
+    blended_home = w_model * model_home + w_market * (market_home_two_way * (1.0 - model_draw))
+    blended_away = w_model * model_away + w_market * (market_away_two_way * (1.0 - model_draw))
+    blended_draw = w_model * model_draw + w_market * model_draw
 
-    blended_home = w_model * initial_home + w_market * (market_home_two_way * remaining)
-    blended_away = w_model * initial_away + w_market * ((1.0 - market_home_two_way) * remaining)
-    blended_draw = initial_draw  # leave draw as estimated
-
-    # normalize to sum 1.0
-    total = blended_home + blended_away + blended_draw
+    total = blended_home + blended_draw + blended_away
     if total <= 0:
-        blended_home = blended_away = 0.33
-        blended_draw = 0.34
+        blended_home = blended_draw = blended_away = 1.0 / 3.0
         total = 1.0
-
     blended_home /= total
-    blended_away /= total
     blended_draw /= total
+    blended_away /= total
 
-    # Suspicion / fix probability
     if analysis is None:
         analysis = detect_suspicious_patterns(match, cfg)
     risk_score = analysis.get('risk_score', 0)
     fix_conf = analysis.get('fix_confidence', 0)
 
-    # Combine risk_score and fix_confidence to a single fix-probability heuristic (0..1)
     fix_prob = (0.6 * (risk_score / 100.0)) + (0.4 * (fix_conf / 100.0))
     fix_prob = max(0.0, min(1.0, fix_prob))
 
-    # If suspected_result exists, nudge probabilities toward the suspected side by an amount proportional to fix_prob
     suspected = analysis.get('suspected_result')
+
     if suspected:
-        # determine which side is favored by the manipulation signal
         if suspected.endswith('_FAIL'):
-            # if a team is expected to FAIL, the opposite side is the value/winner
             fail_side = suspected.split('_')[0]
             favored_side = 'AWAY' if fail_side == 'HOME' else 'HOME'
         else:
             favored_side = suspected.split('_')[0]
 
-        # nudge factor (max ~0.25 when fix_prob=1)
-        nudge = fix_prob * 0.25
-        # apply nudge additively to favored side, reduce others proportionally
-        if favored_side == 'HOME':
-            before = blended_home
-            blended_home += nudge
-            reduce_total = nudge
-            other_sum = blended_away + blended_draw
-            if other_sum > 1e-9:
-                blended_away *= max(0.0, (1.0 - (reduce_total * (blended_away / other_sum)) / blended_away)) if blended_away > 0 else 0.0
-                blended_draw *= max(0.0, (1.0 - (reduce_total * (blended_draw / other_sum)) / blended_draw)) if blended_draw > 0 else 0.0
-            # if numerical issues occurred, fallback to proportional scaling
-        else:
-            before = blended_away
-            blended_away += nudge
-            reduce_total = nudge
-            other_sum = blended_home + blended_draw
-            if other_sum > 1e-9:
-                blended_home *= max(0.0, (1.0 - (reduce_total * (blended_home / other_sum)) / blended_home)) if blended_home > 0 else 0.0
-                blended_draw *= max(0.0, (1.0 - (reduce_total * (blended_draw / other_sum)) / blended_draw)) if blended_draw > 0 else 0.0
+        if fix_prob >= ov_threshold:
+            rem = 1.0 - ov_strength
+            draw_share = rem * 0.20
+            other_share = rem - draw_share
 
-        # simpler robust approach: if the above proportional adjustments create NaN or sum !=1, re-normalize
-        total = blended_home + blended_away + blended_draw
-        if total <= 0:
-            blended_home = blended_away = blended_draw = 1.0 / 3.0
-        else:
-            blended_home /= total
-            blended_away /= total
-            blended_draw /= total
+            if favored_side == 'HOME':
+                final_home = ov_strength
+                final_draw = draw_share
+                final_away = other_share
+            else:
+                final_away = ov_strength
+                final_draw = draw_share
+                final_home = other_share
 
-    # final percentages
+            s = final_home + final_draw + final_away
+            if s <= 0:
+                final_home = final_draw = final_away = 1.0 / 3.0
+            else:
+                final_home /= s
+                final_draw /= s
+                final_away /= s
+
+            blended_home, blended_draw, blended_away = final_home, final_draw, final_away
+
+        else:
+            alpha = fix_prob * global_max_nudge
+            if favored_side == 'HOME':
+                prior = np.array([1.0, 0.0, 0.0])
+            else:
+                prior = np.array([0.0, 0.0, 1.0])
+
+            blended = np.array([blended_home, blended_draw, blended_away])
+            final = (1.0 - alpha) * blended + alpha * prior
+            s = final.sum()
+            if s <= 0:
+                final = np.array([1/3, 1/3, 1/3])
+            else:
+                final = final / s
+            blended_home, blended_draw, blended_away = float(final[0]), float(final[1]), float(final[2])
+
     home_pct = float(round(blended_home * 100.0, 1))
     draw_pct = float(round(blended_draw * 100.0, 1))
     away_pct = float(round(blended_away * 100.0, 1))
     fix_probability_pct = float(round(fix_prob * 100.0, 1))
 
     explanation = (
-        f"1X2 uses AH-derived model (60%) blended with market implied two-way (40%). "
-        f"Draw estimated from expected goals and pre-line. Fix probability derived from risk score & fix confidence ({fix_probability_pct}%)."
+        f"1X2 uses a Poisson model (from OU expected goals) to estimate Home/Draw/Away. "
+        f"Home/Away distribution is blended with market two-way (weights: model={w_model}, market={w_market}). "
+        f"If fix probability ≥ {int(ov_threshold*100)}% the distribution is overridden so the suspected side has {int(ov_strength*100)}% share."
     )
 
     return {
@@ -884,6 +845,9 @@ def predict_1x2(match, cfg, analysis=None):
         'fix_probability_pct': fix_probability_pct,
         'explanation': explanation,
         'raw': {
+            'model_home': model_home,
+            'model_draw': model_draw,
+            'model_away': model_away,
             'blended_home': blended_home,
             'blended_draw': blended_draw,
             'blended_away': blended_away,
@@ -895,14 +859,6 @@ def predict_1x2(match, cfg, analysis=None):
 # Asian Handicap explanation helper
 # -----------------------
 def generate_ah_explanation_html(ah_pick):
-    """
-    Given a pick string like "Away -0.25" or "Home +0.50", generate an HTML
-    explanation table describing outcomes for:
-      - Pick team wins
-      - Match draw
-      - Pick team loses
-    This covers common quarter-line cases: .00, .25, .50, .75
-    """
     try:
         parts = ah_pick.split()
         side = parts[0]
@@ -912,16 +868,12 @@ def generate_ah_explanation_html(ah_pick):
 
     sign = -1 if line_val < 0 else 1
     abs_line = abs(line_val)
-    # Determine fractional part in quarters (0, 1, 2, 3)
     quarters = int(round(abs_line * 4)) % 4
-    int_part = int(abs_line)  # whole number part
+    int_part = int(abs_line)
 
-    # Helpers to build rows
     def row(outcome, label, explanation):
         return f"<tr><th style='width:34%'>{outcome}</th><td style='width:14%'>{label}</td><td>{explanation}</td></tr>"
 
-    # Compute descriptions
-    # Generic defaults (safe fallbacks)
     pick_wins_label = "✅ Full Win"
     pick_wins_expl = "Both halves / full stake win (depending on split)."
 
@@ -931,12 +883,8 @@ def generate_ah_explanation_html(ah_pick):
     pick_loses_label = "❌ Full Loss"
     pick_loses_expl = "Both halves / full stake lose."
 
-    # Cases by quarters
     if quarters == 0:
-        # whole number e.g., 0.00, 1.00, 2.00
-        # Example: -1.00 means picked team gives 1 goal
         if int_part == 0:
-            # 0.00 (no handicap)
             pick_wins_label = "✅ Full Win"
             pick_wins_expl = "If the picked team wins the match, bet wins; draw is a push; loss is a full loss."
             draw_label = "➖ Push"
@@ -944,7 +892,6 @@ def generate_ah_explanation_html(ah_pick):
             pick_loses_label = "❌ Full Loss"
             pick_loses_expl = "Bet loses if picked team loses."
         else:
-            # whole >0
             pick_wins_label = "✅ Full Win (if win by more than {})".format(int_part)
             pick_wins_expl = f"Picked team must win by more than {int_part} goal(s) for a full win. If they win by exactly {int_part} it's a push (refund)."
             draw_label = "❌ Full Loss"
@@ -952,9 +899,6 @@ def generate_ah_explanation_html(ah_pick):
             pick_loses_label = "❌ Full Loss"
             pick_loses_expl = "Picked team loses => full loss."
     elif quarters == 1:
-        # .25
-        # Negative (team gives -0.25): split between 0 and -0.5 -> draw => half loss
-        # Positive (+0.25): draw => half win
         pick_wins_label = "✅ Full Win"
         pick_wins_expl = "If the picked team wins the match (any margin), the bet is a full win."
         if sign < 0:
@@ -966,7 +910,6 @@ def generate_ah_explanation_html(ah_pick):
         pick_loses_label = "❌ Full Loss"
         pick_loses_expl = "If the picked team loses the match, both halves lose."
     elif quarters == 2:
-        # .50
         pick_wins_label = "✅ Full Win"
         pick_wins_expl = "Picked team wins = full win."
         if sign < 0:
@@ -978,9 +921,6 @@ def generate_ah_explanation_html(ah_pick):
         pick_loses_label = "❌ Full Loss"
         pick_loses_expl = "Picked team loses => full loss."
     elif quarters == 3:
-        # .75 (split between .5 and 1.0)
-        # Negative (e.g., -0.75): win by 2+ full win; win by 1 => half win; draw => full loss
-        # Positive (+0.75): draw => half win; win by 1 => half win; win by 2+ full win
         pick_wins_label = "✅ Full Win / Half Win"
         if sign < 0:
             pick_wins_expl = "If picked team wins by 2+ goals => full win. If they win by exactly 1 => half win (one half wins, one half pushes)."
@@ -993,7 +933,6 @@ def generate_ah_explanation_html(ah_pick):
         pick_loses_label = "❌ Full Loss"
         pick_loses_expl = "Picked team loses => full loss."
 
-    # Build HTML
     side_label = side
     html = f"""
     <div class='ah-explain'>
@@ -1009,9 +948,6 @@ def generate_ah_explanation_html(ah_pick):
     return html
 
 def generate_ou_explanation_html(ou_pick, expected_goals, explanation):
-    """
-    Simple OU explanation block describing what OVER/UNDER X means and a short note.
-    """
     try:
         side, thr = ou_pick.split()
     except Exception:
@@ -1037,8 +973,6 @@ if st.session_state.matches:
     st.header("📊 Match Analysis Dashboard")
     last_match = st.session_state.matches[-1]
 
-    # Prepare config dict from sidebar inputs (read current values from session-like variables)
-    # If the expander wasn't opened, the variables still exist with defaults defined above.
     cfg = {
         'reverse_line_threshold': float(reverse_line_threshold),
         'reverse_odds_pct': float(reverse_odds_pct),
@@ -1056,14 +990,12 @@ if st.session_state.matches:
         prediction = predict_outcome(last_match, cfg)
         ou_prediction = predict_over_under(last_match, cfg)
 
-        # compute 1X2 including anomaly/fix probability
         analysis_for_1x2 = detect_suspicious_patterns(last_match, cfg)
         one_x_two = predict_1x2(last_match, cfg, analysis=analysis_for_1x2)
 
         confidence_level = "high" if prediction['confidence'] > 75 else "medium" if prediction['confidence'] > 60 else "low"
         box_class = f"{confidence_level}-confidence"
 
-        # Main AH prediction box
         st.markdown(f"""
         <div class="prediction-box {box_class}">
             <h3>🎯 Market Prediction: {prediction['predicted_winner']} Team</h3>
@@ -1074,12 +1006,10 @@ if st.session_state.matches:
         </div>
         """, unsafe_allow_html=True)
 
-        # AH explanation for new users (always shown for the predicted AH pick)
         ah_html = generate_ah_explanation_html(prediction['ah_pick'])
         if ah_html:
             st.markdown(ah_html, unsafe_allow_html=True)
 
-        # Over/Under prediction box
         ou_conf_level = "high" if ou_prediction['ou_confidence'] > 75 else "medium" if ou_prediction['ou_confidence'] > 60 else "low"
         ou_box_class = f"{ou_conf_level}-confidence"
         st.markdown(f"""
@@ -1090,8 +1020,6 @@ if st.session_state.matches:
         </div>
         """, unsafe_allow_html=True)
 
-        # 1X2 prediction box (NEW)
-        # Determine visual class: if max outcome pct > 60 => high, >45 => medium, else low
         max_pct = max(one_x_two['home_pct'], one_x_two['draw_pct'], one_x_two['away_pct'])
         one_class = "high-confidence" if max_pct > 60 else "medium-confidence" if max_pct > 45 else "low-confidence"
         st.markdown(f"""
@@ -1103,18 +1031,14 @@ if st.session_state.matches:
         </div>
         """, unsafe_allow_html=True)
 
-        # OU explanation block
         st.markdown(generate_ou_explanation_html(ou_prediction['ou_pick'], ou_prediction['expected_goals'], ou_prediction['explanation']), unsafe_allow_html=True)
 
-        # Explanations (tooltips) in an expander
         with st.expander("Why this prediction? (explain metrics)"):
-            st.write("- Line movement weighted 40% of score for AH prediction.")
-            st.write("- Odds movement normalized by league volatility and weighted 35% for AH prediction.")
-            st.write("- Current market position (which side has lower odds) weighted 25% for AH prediction.")
-            st.write("- 1X2 blends the AH-derived model (60%) with market implied two-way (40%). Draw is estimated from expected goals and pre-line.")
-            st.write("- Fix probability comes from the anomaly detector (risk score + fix confidence). When a high fix probability and a suspected manipulation side exists, 1X2 is nudged toward the suspected outcome.")
-            st.write("- Over/Under uses a heuristic: baseline 2.5 goals adjusted by average odds movement and line shifts.")
-            st.write("- Both predictions include conservative confidence scaling for neutral markets.")
+            st.write("- 1X2 now uses a Poisson model derived from the Over/Under expected goals to compute Home/Draw/Away probabilities (more consistent draw estimation).")
+            st.write("- Home/Away split is derived purely from market AH line (no team stats available).")
+            st.write("- You can tune blending weights between the Poisson model and the market two-way in the sidebar.")
+            st.write("- If anomaly detection suggests a manipulated side, a bounded nudge (user-tunable) moves probabilities toward the suspected side. Extremely high fix probability can trigger an override (also tunable).")
+            st.write("- Probabilities are normalized and guarded to avoid numeric instability.")
 
     with tab2:
         st.subheader("🚨 Match Integrity Analysis")
@@ -1141,7 +1065,6 @@ if st.session_state.matches:
         </div>
         """, unsafe_allow_html=True)
 
-        # Suspected result display with WIN/FAIL semantics
         if suspected_result:
             if suspected_result.endswith('_FAIL'):
                 fail_side = suspected_result.split('_')[0]
@@ -1152,7 +1075,7 @@ if st.session_state.matches:
                 st.markdown(f"""
                 <div class="prediction-box {'suspicious' if fix_confidence >= 70 else 'medium-confidence' if fix_confidence >= 40 else 'high-confidence'}">
                     <h2>🎯 TEAM EXPECTED TO FAIL</h2>
-                    <h1 style='color: {'darkred' if fix_confidence >= 70 else 'darkorange' if fix_confidence >= 40 else 'darkgreen'}; font-size: 2.4rem; text-align: center;'>
+                    <h1 style='color: {"darkred" if fix_confidence >= 70 else "darkorange" if fix_confidence >= 40 else "darkgreen"}; font-size: 2.4rem; text-align: center;'>
                         {failing_team} (EXPECTED TO FAIL)
                     </h1>
                     <h3 style='text-align: center;'>Value Side / Opposite: {value_team}</h3>
@@ -1160,7 +1083,6 @@ if st.session_state.matches:
                     <p style='text-align: center;'><strong>Asian Handicap (OPPOSITE SIDE VALUE):</strong> {ah_pick}</p>
                 </div>
                 """, unsafe_allow_html=True)
-                # show AH explanation for the recommended value side pick
                 st.markdown(generate_ah_explanation_html(ah_pick), unsafe_allow_html=True)
             else:
                 win_side = suspected_result.split('_')[0]
@@ -1169,17 +1091,15 @@ if st.session_state.matches:
                 st.markdown(f"""
                 <div class="prediction-box {'suspicious' if fix_confidence >= 70 else 'medium-confidence' if fix_confidence >= 40 else 'high-confidence'}">
                     <h2>🎯 TEAM EXPECTED TO WIN</h2>
-                    <h1 style='color: {'darkred' if fix_confidence >= 70 else 'darkorange' if fix_confidence >= 40 else 'darkgreen'}; font-size: 2.8rem; text-align: center;'>
+                    <h1 style='color: {"darkred" if fix_confidence >= 70 else "darkorange" if fix_confidence >= 40 else "darkgreen"}; font-size: 2.8rem; text-align: center;'>
                         {winning_team} (EXPECTED WIN)
                     </h1>
                     <h2 style='text-align: center;'>Fix Confidence: {fix_confidence}%</h2>
                     <p style='text-align: center;'><strong>Asian Handicap:</strong> {ah_pick}</p>
                 </div>
                 """, unsafe_allow_html=True)
-                # show AH explanation for the suspected pick
                 st.markdown(generate_ah_explanation_html(ah_pick), unsafe_allow_html=True)
 
-            # Betting recommendation wording
             if fix_confidence >= 70:
                 stake = "x1.5–2.0 (aggressive multiplier)"
                 rec_type = "STRONG"
@@ -1206,7 +1126,6 @@ if st.session_state.matches:
             </div>
             """, unsafe_allow_html=True)
 
-        # Show flags and indicators
         if analysis['flags']:
             st.subheader("📋 Detected Patterns")
             for flag in analysis['flags']:
@@ -1222,7 +1141,6 @@ if st.session_state.matches:
             for indicator in analysis['manipulation_indicators']:
                 st.warning(indicator)
 
-        # Gauges
         col1, col2 = st.columns(2)
         with col1:
             fig = go.Figure(go.Indicator(
@@ -1257,7 +1175,6 @@ if st.session_state.matches:
             ))
             st.plotly_chart(fig2, use_container_width=True)
 
-        # Explanations
         with st.expander("What do these metrics mean?"):
             st.write("- Risk Score: aggregated suspicion level (higher = more suspicious).")
             st.write("- Fix Confidence: how confident the system is that the market reflects manipulation/fixing.")
@@ -1277,23 +1194,20 @@ if st.session_state.matches:
             away_odds = [last_match['open_away'], last_match['pre_away'], last_match['pre_away']]
             lines = [last_match['open_line'], last_match['pre_line'], last_match['pre_line']]
 
-        # Odds chart
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=stages, y=home_odds, mode='lines+markers', name='Home Odds', line=dict(color='blue', width=3)))
         fig.add_trace(go.Scatter(x=stages, y=away_odds, mode='lines+markers', name='Away Odds', line=dict(color='red', width=3)))
         fig.update_layout(title="Odds Movement", xaxis_title="Stage", yaxis_title="Odds", height=420)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Line movement bar with polarity coloring and arrows
         colors = []
         annotations = []
         for i, l in enumerate(lines):
-            # negative => home favorite (green tint), positive => away favorite (red tint)
             if l < 0:
-                colors.append('rgba(0,153,51,0.6)')  # greenish
+                colors.append('rgba(0,153,51,0.6)')
                 arrows = "⬇️" if l < 0 else ""
             elif l > 0:
-                colors.append('rgba(204,0,0,0.6)')  # reddish
+                colors.append('rgba(204,0,0,0.6)')
                 arrows = "⬆️" if l > 0 else ""
             else:
                 colors.append('rgba(120,120,120,0.5)')
@@ -1327,7 +1241,6 @@ if st.session_state.matches:
                     else:
                         suspected_txt = f"{match['home_team'] if sr.startswith('HOME') else match['away_team']} (EXPECTED WIN)"
 
-                # store detailed metrics for backtesting / logging
                 history_data.append({
                     'Match': f"{match['home_team']} vs {match['away_team']}",
                     'Suspected Result': suspected_txt,
@@ -1364,20 +1277,11 @@ else:
     st.info("👈 Enter match data in the sidebar to start")
     st.markdown("""
     ### Key Improvements (summary)
-    - Favorite detection uses meaningful thresholds (±0.25, ±0.75) and corroborates with odds.
-    - Odds movement normalized by league volatility; thresholds configurable per league/profile.
-    - Line/odds correlation reinforced with small bonuses; misalignment penalizes.
-    - Reverse correlation detection requires both meaningful line shift and opposite odds rise.
-    - Steam moves consider timing (within configurable window after record time).
-    - Live odds logic requires explicit 'Match has started' checkbox to avoid false pre-kickoff live feeds.
-    - Margin alerts only flagged when aligned with other suspicious signals and with reduced weight.
-    - Outcome locking on reverse detection; override only allowed by extreme live movements.
-    - Refactored detection into helper functions for maintainability.
-    - Thresholds exposed in sidebar in a collapsed expander so power users can tune per league/market.
-    - History stores additional metrics for post-analysis/backtesting.
-    - Team naming removed from user input; fixed names "HOME" and "AWAY" used to reduce accidental mislabeling.
-    - Added Over/Under heuristic prediction (OVER/UNDER 0.5,1.5,2.5,3.5,4.5) with confidence based on AH & odds movement.
-    - Added 1X2 prediction (Home/Draw/Away) with percentages and a separate anomaly/fix probability. 1X2 blends AH-based model with market implied two-way and uses the OU expected goals to estimate draw likelihood.
+    - 1X2 uses a Poisson-based approach (from expected goals) to compute Home/Draw/Away probabilities, replacing the previous simple draw heuristic.
+    - Home/Away split is derived from the AH pre_line to stay within your constraint of only using odds data.
+    - Blending weights between model and market two-way are user-tunable in the sidebar (no historical data needed).
+    - Override behavior: when fix probability is very high (user-configurable), 1X2 can force a strong recommendation toward the suspected side while preserving a small residual for other outcomes.
+    - The manipulation nudge is bounded and applied in a stable additive way to avoid numeric instability.
     """)
 
 st.markdown("---")
